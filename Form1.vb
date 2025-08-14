@@ -10,6 +10,28 @@ Public Class Form1
         LoadFileCategories()
     End Sub
 
+    Private Sub TryOpenExternal(filePath As String)
+        Try
+            If String.IsNullOrWhiteSpace(filePath) Then Return
+
+            Dim psi As New ProcessStartInfo()
+            psi.FileName = filePath
+            psi.UseShellExecute = True
+            psi.ErrorDialog = False
+
+            Process.Start(psi)
+        Catch ex As System.ComponentModel.Win32Exception
+            ' Error code 1223 (0x4C7) is "The operation was canceled by the user"
+            ' Silently ignore this specific case to avoid alarming the user
+            Const ERROR_CANCELLED As Integer = 1223
+            If ex.NativeErrorCode <> ERROR_CANCELLED Then
+                MessageBox.Show($"Cannot open file: {ex.Message}", "Open Error", MessageBoxButtons.OK, MessageBoxIcon.Information)
+            End If
+        Catch ex As Exception
+            MessageBox.Show($"Cannot open file: {ex.Message}", "Open Error", MessageBoxButtons.OK, MessageBoxIcon.Information)
+        End Try
+    End Sub
+
     Private Sub InitializeForm()
         ' Setup DataGridView columns
         With DataGridView1
@@ -70,6 +92,13 @@ Public Class Form1
         If DataGridView1.SelectedRows.Count > 0 Then
             Dim filePath As String = DataGridView1.SelectedRows(0).Cells("Path").Value.ToString()
             Dim fileName As String = DataGridView1.SelectedRows(0).Cells("Name").Value.ToString()
+
+            ' Block deletions inside protected locations (system/dev folders) or of protected project files
+            If IsProtectedPath(filePath) OrElse IsProtectedFileType(filePath) Then
+                MessageBox.Show("This file is in a protected system/project folder and will not be deleted.",
+                              "Protected Location", MessageBoxButtons.OK, MessageBoxIcon.Information)
+                Return
+            End If
 
             Dim result As DialogResult = MessageBox.Show($"Are you sure you want to delete '{fileName}'?",
                                                         "Confirm Delete",
@@ -235,7 +264,7 @@ Public Class Form1
             Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
             Environment.GetFolderPath(Environment.SpecialFolder.MyMusic),
             Environment.GetFolderPath(Environment.SpecialFolder.MyVideos),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads")
+            System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads")
         }
 
         For Each searchPath As String In searchPaths
@@ -258,6 +287,11 @@ Public Class Form1
         Try
             Dim dir As New DirectoryInfo(path)
 
+            ' Skip protected directories entirely
+            If IsProtectedPath(dir.FullName) Then
+                Return
+            End If
+
             ' Scan files in current directory
             For Each file As FileInfo In dir.GetFiles()
                 Try
@@ -278,10 +312,11 @@ Public Class Form1
             ' Recursively scan subdirectories (limit depth to avoid infinite loops)
             For Each subDir As DirectoryInfo In dir.GetDirectories()
                 Try
-                    ' Skip system directories
+                    ' Skip system and protected directories
                     If Not subDir.Name.StartsWith("$") AndAlso
                        Not subDir.Attributes.HasFlag(FileAttributes.System) AndAlso
-                       Not subDir.Attributes.HasFlag(FileAttributes.Hidden) Then
+                       Not subDir.Attributes.HasFlag(FileAttributes.Hidden) AndAlso
+                       Not IsProtectedPath(subDir.FullName) Then
                         ScanDirectory(subDir.FullName, extensions, files, category)
                     End If
                 Catch
@@ -294,6 +329,89 @@ Public Class Form1
             ' Skip directories that can't be accessed
         End Try
     End Sub
+
+    ' Determine if a path (file or directory) is in a protected system/dev location
+    Private Function IsProtectedPath(inputPath As String) As Boolean
+        If String.IsNullOrWhiteSpace(inputPath) Then Return False
+
+        Dim fullPath As String
+        Try
+            fullPath = System.IO.Path.GetFullPath(inputPath)
+        Catch
+            Return False
+        End Try
+
+        Dim directoryToCheck As String = fullPath
+        If File.Exists(fullPath) Then
+            Try
+                directoryToCheck = System.IO.Path.GetDirectoryName(fullPath)
+            Catch
+                Return False
+            End Try
+        End If
+
+        If String.IsNullOrEmpty(directoryToCheck) Then Return False
+
+        Dim userProfile As String = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+        Dim protectedRoots As New List(Of String) From {
+            Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            System.IO.Path.Combine(userProfile, "source", "repos")
+        }
+
+        ' If the directory is under any protected root, block it
+        For Each root In protectedRoots
+            If Not String.IsNullOrEmpty(root) AndAlso IsInsidePath(directoryToCheck, root) Then
+                Return True
+            End If
+        Next
+
+        ' Also block common dev/system subfolders anywhere in the path
+        Dim blockedFolderNames As String() = {".git", ".vs", "bin", "obj", "node_modules", "packages"}
+        If PathContainsAnyFolder(directoryToCheck, blockedFolderNames) Then
+            Return True
+        End If
+
+        Return False
+    End Function
+
+    ' Check for sensitive project file types
+    Private Function IsProtectedFileType(filePath As String) As Boolean
+        Dim ext As String = System.IO.Path.GetExtension(filePath).ToLower()
+        Dim sensitive As String() = {".sln", ".csproj", ".vbproj", ".fsproj", ".vcxproj", ".vcproj", ".proj", ".props", ".targets"}
+        For Each s In sensitive
+            If s = ext Then Return True
+        Next
+        Return False
+    End Function
+
+    Private Function IsInsidePath(childPath As String, parentPath As String) As Boolean
+        Try
+            Dim childFull As String = System.IO.Path.GetFullPath(childPath.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar)) & System.IO.Path.DirectorySeparatorChar
+            Dim parentFull As String = System.IO.Path.GetFullPath(parentPath.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar)) & System.IO.Path.DirectorySeparatorChar
+            Return childFull.StartsWith(parentFull, StringComparison.OrdinalIgnoreCase)
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function PathContainsAnyFolder(inputPath As String, folderNames As String()) As Boolean
+        If String.IsNullOrEmpty(inputPath) Then Return False
+        Dim separators() As Char = {System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar}
+        Dim parts As String() = inputPath.Split(separators, StringSplitOptions.RemoveEmptyEntries)
+        For Each part As String In parts
+            For Each folderName As String In folderNames
+                If String.Equals(part, folderName, StringComparison.OrdinalIgnoreCase) Then
+                    Return True
+                End If
+            Next
+        Next
+        Return False
+    End Function
 
     Private Sub DataGridView1_SelectionChanged(sender As Object, e As EventArgs) Handles DataGridView1.SelectionChanged
         ShowFilePreview()
@@ -364,20 +482,12 @@ Public Class Form1
 
             ' Add click event to open image externally
             AddHandler pictureBox.Click, Sub()
-                                             Try
-                                                 Process.Start(filePath)
-                                             Catch ex As Exception
-                                                 MessageBox.Show($"Cannot open image: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error)
-                                             End Try
+                                             TryOpenExternal(filePath)
                                          End Sub
 
             ' Add double-click event for better UX
             AddHandler pictureBox.DoubleClick, Sub()
-                                                   Try
-                                                       Process.Start(filePath)
-                                                   Catch ex As Exception
-                                                       MessageBox.Show($"Cannot open image: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error)
-                                                   End Try
+                                                   TryOpenExternal(filePath)
                                                End Sub
 
             ' Add tooltip to inform user
@@ -451,7 +561,7 @@ Public Class Form1
             openBtn.Text = "Open External"
             openBtn.Dock = DockStyle.Bottom
             openBtn.Height = 30
-            AddHandler openBtn.Click, Sub() Process.Start(filePath)
+            AddHandler openBtn.Click, Sub() TryOpenExternal(filePath)
             pdfPanel.Controls.Add(openBtn)
 
             Panel1.Controls.Add(pdfPanel)
@@ -499,7 +609,7 @@ Public Class Form1
             openBtn.Text = "Open External"
             openBtn.Dock = DockStyle.Bottom
             openBtn.Height = 30
-            AddHandler openBtn.Click, Sub() Process.Start(filePath)
+            AddHandler openBtn.Click, Sub() TryOpenExternal(filePath)
             officePanel.Controls.Add(openBtn)
 
             Panel1.Controls.Add(officePanel)
@@ -536,7 +646,7 @@ Public Class Form1
             playBtn.Text = "Play"
             playBtn.Dock = DockStyle.Bottom
             playBtn.Height = 30
-            AddHandler playBtn.Click, Sub() Process.Start(filePath)
+            AddHandler playBtn.Click, Sub() TryOpenExternal(filePath)
             audioPanel.Controls.Add(playBtn)
 
             Panel1.Controls.Add(audioPanel)
@@ -573,7 +683,7 @@ Public Class Form1
             playBtn.Text = "Play"
             playBtn.Dock = DockStyle.Bottom
             playBtn.Height = 30
-            AddHandler playBtn.Click, Sub() Process.Start(filePath)
+            AddHandler playBtn.Click, Sub() TryOpenExternal(filePath)
             videoPanel.Controls.Add(playBtn)
 
             Panel1.Controls.Add(videoPanel)
@@ -615,7 +725,7 @@ Public Class Form1
             openBtn.Text = "Open External"
             openBtn.Dock = DockStyle.Bottom
             openBtn.Height = 30
-            AddHandler openBtn.Click, Sub() Process.Start(filePath)
+            AddHandler openBtn.Click, Sub() TryOpenExternal(filePath)
             genericPanel.Controls.Add(openBtn)
 
             Panel1.Controls.Add(genericPanel)
